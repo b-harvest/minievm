@@ -2,11 +2,15 @@ package jsonrpc
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
+	"time"
 
+	"cosmossdk.io/log"
 	"github.com/gorilla/mux"
 	ethns "github.com/initia-labs/minievm/jsonrpc/namespaces/eth"
+	"github.com/initia-labs/minievm/jsonrpc/namespaces/eth/filters"
 	netns "github.com/initia-labs/minievm/jsonrpc/namespaces/net"
 	"github.com/rs/cors"
 	"golang.org/x/net/netutil"
@@ -21,6 +25,8 @@ import (
 	"github.com/initia-labs/minievm/app"
 	"github.com/initia-labs/minievm/jsonrpc/backend"
 	"github.com/initia-labs/minievm/jsonrpc/config"
+
+	rpcclient "github.com/cometbft/cometbft/rpc/jsonrpc/client"
 )
 
 // RPC namespaces and API version
@@ -46,16 +52,29 @@ func StartJSONRPC(
 	clientCtx client.Context,
 	jsonRPCConfig config.JSONRPCConfig,
 ) error {
+
+	//TODO: use the rpcAddr parameter with reference to config.RPC.ListenAddress
+	cometWsClient := ConnectCometWS("http://127.0.0.1:26657", "/websocket", svrCtx.Logger)
+	if cometWsClient == nil {
+		return errors.New("failed to connect tmWs Server")
+	}
+
 	logger := svrCtx.Logger.With("module", "geth")
 	ethlog.SetDefault(ethlog.NewLogger(newLogger(logger)))
 
 	rpcServer := rpc.NewServer()
-	bkd := backend.NewJSONRPCBackend(app, svrCtx, clientCtx)
+	bkd := backend.NewJSONRPCBackend(app, svrCtx, clientCtx, jsonRPCConfig)
 	apis := []rpc.API{
 		{
 			Namespace: EthNamespace,
 			Version:   apiVersion,
 			Service:   ethns.NewEthAPI(svrCtx.Logger, bkd),
+			Public:    true,
+		},
+		{
+			Namespace: EthNamespace,
+			Version:   apiVersion,
+			Service:   filters.NewFilterAPI(svrCtx.Logger, bkd, clientCtx, cometWsClient),
 			Public:    true,
 		},
 		{
@@ -147,4 +166,33 @@ func listen(addr string, jsonRPCConfig config.JSONRPCConfig) (net.Listener, erro
 		ln = netutil.LimitListener(ln, jsonRPCConfig.MaxOpenConnections)
 	}
 	return ln, err
+}
+
+// reference: https://github.com/evmos/ethermint/blob/fd8c2d25cf80e7d2d2a142e7b374f979f8f51981/server/util.go#L74
+func ConnectCometWS(cometRPCAddr, cometWSEndpoint string, logger log.Logger) *rpcclient.WSClient {
+	cometWSClient, err := rpcclient.NewWS(cometRPCAddr, cometWSEndpoint,
+		rpcclient.MaxReconnectAttempts(256),
+		rpcclient.ReadWait(120*time.Second),
+		rpcclient.WriteWait(120*time.Second),
+		rpcclient.PingPeriod(50*time.Second),
+		rpcclient.OnReconnect(func() {
+			logger.Debug("EVM RPC reconnects to Comet WS", "address", cometRPCAddr+cometWSEndpoint)
+		}),
+	)
+
+	if err != nil {
+		logger.Error(
+			"Comet WS client could not be created",
+			"address", cometRPCAddr+cometWSEndpoint,
+			"error", err,
+		)
+	} else if err := cometWSClient.OnStart(); err != nil {
+		logger.Error(
+			"Comet WS client could not start",
+			"address", cometRPCAddr+cometWSEndpoint,
+			"error", err,
+		)
+	}
+
+	return cometWSClient
 }
